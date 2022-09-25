@@ -46,6 +46,18 @@ impl Tree16 {
             },
         }
     }
+
+    pub fn keys(&self) -> Vec<Vec<U4>> {
+        let mut out = vec![];
+        for (label, node) in &self.children {
+            for mut key in node.keys_reversed() {
+                key.push(*label);
+                key.reverse();
+                out.push(key);
+            }
+        }
+        out
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -54,10 +66,9 @@ pub enum Tree16Node {
         children: BTreeMap<U4, Tree16Node>,
         has_value: bool,
     },
-    Leaf {
-        is_ptr: bool,
-        has_value: bool,
-    },
+    PtrLeaf { has_value: bool },
+    // TODO: rename to "terminal" leaf?
+    ValueLeaf,
 }
 
 impl Arbitrary for Tree16Node {
@@ -65,12 +76,17 @@ impl Arbitrary for Tree16Node {
     type Strategy = BoxedStrategy<Tree16Node>;
 
     fn arbitrary_with(args: ()) -> Self::Strategy {
-        let leaf = any::<(bool, bool)>()
-            .prop_map(|(is_ptr, has_value)| Tree16Node::Leaf { is_ptr, has_value });
+        let leaf = any::<Option<bool>>()
+            .prop_map(|has_value| {
+                match has_value {
+                    Some(has_value) => Tree16Node::PtrLeaf { has_value },
+                    None => Tree16Node::ValueLeaf,
+                }
+            });
         let tree = leaf.prop_recursive(
             15, // At most 15 internal nodes
             16, // At most 16 nodes
-            8,  // Expected 8 branches,
+            8,  // Expected 8 branches
             |element| {
                 let tree = |has_value| {
                     prop::collection::btree_map(any::<U4>(), element.clone(), 0..16)
@@ -101,7 +117,7 @@ impl Arbitrary for Tree16 {
             .prop_filter_map("rootless", |node| {
                 match node {
                     Tree16Node::Branch { children, .. } => Some(Self { children }),
-                    Tree16Node::Leaf { .. } => None,
+                    Tree16Node::PtrLeaf { .. } | Tree16Node::ValueLeaf => None,
                 }
             })
             .boxed()
@@ -110,7 +126,6 @@ impl Arbitrary for Tree16 {
 
 #[derive(Debug, Eq, PartialEq)]
 pub enum QueryResult {
-    Partial,
     Value,
     Pointer { consumed: usize },
     Mismatch
@@ -120,14 +135,15 @@ impl Tree16Node {
     fn has_value(&self) -> bool {
         match self {
             Tree16Node::Branch { has_value, .. } => *has_value,
-            Tree16Node::Leaf { has_value, .. } => *has_value,
+            Tree16Node::PtrLeaf { has_value, .. } => *has_value,
+            Tree16Node::ValueLeaf => true,
         }
     }
 
     fn size(&self) -> usize {
         match self {
             Tree16Node::Branch { children, .. } => 1 + children.values().map(|c| c.size()).sum::<usize>(),
-            Tree16Node::Leaf { .. } => 1,
+            Tree16Node::PtrLeaf { .. } | Tree16Node::ValueLeaf => 1,
         }
     }
 
@@ -137,7 +153,7 @@ impl Tree16Node {
                 if self.has_value() {
                     QueryResult::Value
                 } else {
-                    QueryResult::Partial
+                    QueryResult::Mismatch
                 }
             },
             &[head, ref tail @ ..] => {
@@ -148,20 +164,40 @@ impl Tree16Node {
                             None => QueryResult::Mismatch,
                         }
                     },
-                    Tree16Node::Leaf { is_ptr: true, .. } => QueryResult::Pointer { consumed },
-                    Tree16Node::Leaf { is_ptr: false, .. } => QueryResult::Mismatch,
+                    Tree16Node::PtrLeaf { .. } => QueryResult::Pointer { consumed },
+                    Tree16Node::ValueLeaf => QueryResult::Mismatch,
                 }
             },
         }
     }
+
+    fn keys_reversed(&self) -> Vec<Vec<U4>> {
+        let mut out = vec![];
+        if self.has_value() {
+            out.push(vec![]);
+        }
+        if let Tree16Node::Branch { ref children, .. } = self {
+            for (label, child) in children {
+                for mut key in child.keys_reversed() {
+                    key.push(*label);
+                    out.push(key);
+                }
+            }
+        }
+        out
+    }
+
 }
 
 proptest! {
     #![proptest_config(ProptestConfig { cases: 1024, failure_persistence: None, .. ProptestConfig::default() })]
 
     #[test]
-    fn test_query(t in any::<Tree16>(), key in any::<Vec<U4>>()) {
-        let result = t.query(&key);
-        println!("{t:?} {key:?} => {result:?}");
+    fn test_query(t in any::<Tree16>(), mut keys in any::<Vec<Vec<U4>>>()) {
+        keys.extend(t.keys());
+        for key in keys {
+            let result = t.query(&key);
+            println!("{result:?}");
+        }
     }
 }
