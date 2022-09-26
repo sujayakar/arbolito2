@@ -29,6 +29,12 @@ impl From<U4> for usize {
     }
 }
 
+impl From<U4> for u8 {
+    fn from(n: U4) -> u8 {
+        n.0
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Tree16 {
     pub children: BTreeMap<U4, Tree16Node>,
@@ -37,11 +43,11 @@ pub struct Tree16 {
 impl Tree16 {
     pub fn query(&self, key: &[U4]) -> QueryResult {
         match key {
-            &[] => QueryResult::Mismatch,
+            &[] => QueryResult::Reject,
             &[head, ref tail @ ..] => {
                 match self.children.get(&head) {
                     Some(tree) => tree.query(tail, 1),
-                    None => QueryResult::Mismatch,
+                    None => QueryResult::Reject,
                 }
             },
         }
@@ -60,15 +66,28 @@ impl Tree16 {
     }
 }
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum LeafType {
+    Pointer { has_value: bool },
+    Value,
+}
+
+impl LeafType {
+    pub fn has_value(&self) -> bool {
+        match self {
+            LeafType::Pointer { has_value } => *has_value,
+            LeafType::Value => true,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub enum Tree16Node {
     Branch {
         children: BTreeMap<U4, Tree16Node>,
         has_value: bool,
     },
-    PtrLeaf { has_value: bool },
-    // TODO: rename to "terminal" leaf?
-    ValueLeaf,
+    Leaf(LeafType),
 }
 
 impl Arbitrary for Tree16Node {
@@ -78,10 +97,11 @@ impl Arbitrary for Tree16Node {
     fn arbitrary_with(args: ()) -> Self::Strategy {
         let leaf = any::<Option<bool>>()
             .prop_map(|has_value| {
-                match has_value {
-                    Some(has_value) => Tree16Node::PtrLeaf { has_value },
-                    None => Tree16Node::ValueLeaf,
-                }
+                let leaf_type = match has_value {
+                    Some(has_value) => LeafType::Pointer { has_value },
+                    None => LeafType::Value,
+                };
+                Tree16Node::Leaf(leaf_type)
             });
         let tree = leaf.prop_recursive(
             15, // At most 15 internal nodes
@@ -117,7 +137,7 @@ impl Arbitrary for Tree16 {
             .prop_filter_map("rootless", |node| {
                 match node {
                     Tree16Node::Branch { children, .. } => Some(Self { children }),
-                    Tree16Node::PtrLeaf { .. } | Tree16Node::ValueLeaf => None,
+                    Tree16Node::Leaf(..) => None,
                 }
             })
             .boxed()
@@ -126,34 +146,37 @@ impl Arbitrary for Tree16 {
 
 #[derive(Debug, Eq, PartialEq)]
 pub enum QueryResult {
-    Value,
-    Pointer { consumed: usize },
-    Mismatch
+    // We consumed all of the input and landed on an internal node.
+    FullMatchInternal { has_value: bool },
+    // We consumed all of the input and landed on a leaf.
+    FullMatchLeaf(LeafType),
+    // We consumed some prefix of the input and landed on a pointer leaf.
+    PartialMatch { consumed: usize },
+    // The key does not exist in the tree.
+    Reject,
 }
 
 impl Tree16Node {
     fn has_value(&self) -> bool {
         match self {
             Tree16Node::Branch { has_value, .. } => *has_value,
-            Tree16Node::PtrLeaf { has_value, .. } => *has_value,
-            Tree16Node::ValueLeaf => true,
+            Tree16Node::Leaf(leaf_type) => leaf_type.has_value(),
         }
     }
 
     fn size(&self) -> usize {
         match self {
             Tree16Node::Branch { children, .. } => 1 + children.values().map(|c| c.size()).sum::<usize>(),
-            Tree16Node::PtrLeaf { .. } | Tree16Node::ValueLeaf => 1,
+            Tree16Node::Leaf(..) => 1,
         }
     }
 
     fn query(&self, key: &[U4], consumed: usize) -> QueryResult {
         match key {
             &[] => {
-                if self.has_value() {
-                    QueryResult::Value
-                } else {
-                    QueryResult::Mismatch
+                match self {
+                    Tree16Node::Branch { has_value, .. } => QueryResult::FullMatchInternal { has_value: *has_value },
+                    Tree16Node::Leaf(leaf_type) => QueryResult::FullMatchLeaf(*leaf_type),
                 }
             },
             &[head, ref tail @ ..] => {
@@ -161,11 +184,11 @@ impl Tree16Node {
                     Tree16Node::Branch { ref children, .. } => {
                         match children.get(&head) {
                             Some(tree) => tree.query(tail, consumed + 1),
-                            None => QueryResult::Mismatch,
+                            None => QueryResult::Reject,
                         }
                     },
-                    Tree16Node::PtrLeaf { .. } => QueryResult::Pointer { consumed },
-                    Tree16Node::ValueLeaf => QueryResult::Mismatch,
+                    Tree16Node::Leaf(LeafType::Pointer { .. }) => QueryResult::PartialMatch { consumed },
+                    Tree16Node::Leaf(LeafType::Value) => QueryResult::Reject,
                 }
             },
         }

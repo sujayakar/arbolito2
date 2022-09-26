@@ -2,21 +2,33 @@ use std::collections::VecDeque;
 use maplit::btreemap;
 use proptest::prelude::*;
 
-use crate::model::{Tree16, Tree16Node, QueryResult, U4};
+use crate::model::{LeafType, Tree16, Tree16Node, QueryResult, U4};
 
-#[derive(Debug)]
-struct ScalarNode {
-    parent: Option<U4>,
-    label: U4,
-
-    // TODO: compress these flags.
-    is_ptr: bool,
-    has_value: bool,
-    is_leaf: bool,
+#[derive(Copy, Clone, Debug)]
+pub struct ScalarNode {
+    pub parent: Option<U4>,
+    pub label: U4,
+    pub node_type: NodeType,
 }
 
-struct ScalarTree16 {
-    nodes: Vec<ScalarNode>,
+#[derive(Copy, Clone, Debug)]
+pub enum NodeType {
+    Branch { has_value: bool },
+    Leaf(LeafType),
+}
+
+impl NodeType {
+    pub fn has_value(&self) -> bool {
+        match self {
+            NodeType::Branch { has_value } => *has_value,
+            NodeType::Leaf(leaf_type) => leaf_type.has_value(),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct ScalarTree16 {
+    pub nodes: Vec<ScalarNode>,
 }
 
 impl From<Tree16> for ScalarTree16 {
@@ -28,22 +40,19 @@ impl From<Tree16> for ScalarTree16 {
         let mut nodes = Vec::with_capacity(16);
         while let Some((parent, label, child)) = queue.pop_front() {
             let i = U4::try_from(nodes.len()).unwrap();
-            let (is_ptr, has_value, is_leaf) = match child {
+            let node_type = match child {
                 Tree16Node::Branch { children, has_value } => {
                     for (label, child) in children {
                         queue.push_back((Some(i), label, child));
                     }
-                    (false, has_value, false)
+                    NodeType::Branch { has_value }
                 },
-                Tree16Node::PtrLeaf { has_value } => (true, has_value, true),
-                Tree16Node::ValueLeaf => (false, true, true),
+                Tree16Node::Leaf(leaf_type) => NodeType::Leaf(leaf_type),
             };
             let node = ScalarNode {
                 parent,
                 label,
-                is_ptr,
-                has_value,
-                is_leaf,
+                node_type,
             };
             nodes.push(node);
         }
@@ -55,7 +64,7 @@ impl From<Tree16> for ScalarTree16 {
 impl ScalarTree16 {
     fn query(&self, key: &[U4]) -> QueryResult {
         if key.is_empty() {
-            return QueryResult::Mismatch;
+            return QueryResult::Reject;
         }
 
         // Construct "bitsets" of length `key.len()` for each node.
@@ -119,14 +128,11 @@ impl ScalarTree16 {
             .enumerate()
             .filter_map(|(i, matches)| {
                 if matches[key.len() - 1] {
-                    let node = &self.nodes[i];
-                    if node.has_value {
-                        return Some(QueryResult::Value);
-                    }
-                    // TODO: Resume feeding in more bytes.
-                    // if !node.is_leaf {
-                    //     return Some(QueryResult::Partial);
-                    // }
+                    let result = match self.nodes[i].node_type {
+                        NodeType::Leaf(leaf_type) => QueryResult::FullMatchLeaf(leaf_type),
+                        NodeType::Branch { has_value } => QueryResult::FullMatchInternal { has_value },
+                    };
+                    return Some(result);
                 }
                 None
             })
@@ -135,9 +141,11 @@ impl ScalarTree16 {
         let mut prefix_match = vec![];
         for (len, node_matches) in matches.iter().enumerate() {
             for (i, matches) in node_matches.iter().enumerate() {
-                let node = &self.nodes[i];
-                if matches[len] && node.is_ptr && len + 1 < key.len() {
-                    prefix_match.push(QueryResult::Pointer { consumed: len + 1 });
+                if !matches[len] || len + 1 == key.len() {
+                    continue;
+                }
+                if let NodeType::Leaf(LeafType::Pointer { .. }) = self.nodes[i].node_type {
+                    prefix_match.push(QueryResult::PartialMatch { consumed: len + 1 });
                 }
             }
         }
@@ -148,7 +156,7 @@ impl ScalarTree16 {
         if let Some(r) = prefix_match.pop() {
             return r;
         }
-        QueryResult::Mismatch
+        QueryResult::Reject
     }
 }
 
@@ -156,7 +164,7 @@ impl ScalarTree16 {
 fn trophycase() -> anyhow::Result<()> {
     let t = Tree16 {
         children: btreemap!(
-            U4::try_from(11)? => Tree16Node::PtrLeaf { has_value: false },
+            U4::try_from(11)? => Tree16Node::Leaf(LeafType::Pointer { has_value: false }),
         ),
     };
     let key = vec![U4::try_from(11)?];
@@ -168,7 +176,7 @@ fn trophycase() -> anyhow::Result<()> {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig { cases: 1024, failure_persistence: None, .. ProptestConfig::default() })]
+    #![proptest_config(ProptestConfig { failure_persistence: None, .. ProptestConfig::default() })]
 
     #[test]
     fn test_matches_tree16(t in any::<Tree16>(), mut keys in any::<Vec<Vec<U4>>>()) {
