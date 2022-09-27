@@ -1,5 +1,5 @@
 use std::simd::u8x16;
-use std::simd::{SimdPartialEq, ToBitMask};
+use std::simd::{SimdPartialEq, ToBitMask, SimdUint};
 use std::arch::aarch64::{
     uint8x8_t,
     uint8x8x2_t,
@@ -110,6 +110,66 @@ impl SimdTree16 {
     }
 
     #[inline(never)]
+    fn matches2(&self, match_bitset: u8x16, key_len: usize) -> QueryResult {
+        let zero = u8x16::splat(0);
+        let one = u8x16::splat(1);
+        let mut step = [0u8; 16];
+        for i in 0..16 {
+            step[i] = i as u8;
+        }
+        let step = u8x16::from(step);
+
+        let under_root = (u8x16::splat(0b1000_0000) & self.nodes).simd_ne(zero);
+        let has_parent = (u8x16::splat(0b1000_0000) & self.nodes).simd_eq(zero);
+        let is_ptr = (u8x16::splat(0b0001_0000) & self.nodes).simd_ne(zero);
+        let parent_ix = (u8x16::splat(0b0000_1111) & self.nodes);
+
+        let matches_char = u8x16::splat(1) & match_bitset;
+        let mut matches = under_root.select(matches_char, zero);
+        let mut prefix_matches = is_ptr.select(matches, zero);
+
+        for i in 0..7 {
+            if i >= key_len {
+                break;
+            }
+            let from_parent = arm_shuffle(matches, parent_ix);
+            let next_matches = (from_parent << one) & match_bitset;
+            let next_matches = has_parent.select(next_matches, zero);
+
+            prefix_matches |= is_ptr.select(next_matches, zero);
+
+            matches = next_matches;
+        }
+
+        let mut result = QueryResult::Reject;
+
+        let prefix_match = prefix_matches.reduce_sum();
+        if prefix_match > 0 {
+            let consumed = prefix_match.trailing_zeros() as usize + 1;
+            result = QueryResult::PartialMatch { consumed };
+        }
+        let exact_match = matches.simd_ne(zero).select(step, zero).reduce_sum();
+        if exact_match > 0 {
+            debug_assert!(exact_match < 16);
+            let node = unsafe { self.nodes.as_array().get_unchecked(exact_match as usize) };
+            let is_ptr = node & (1 << 4) != 0;
+            let has_value = node & (1 << 5) != 0;
+            let is_branch = node & (1 << 6) != 0;
+            if is_branch {
+                result = QueryResult::FullMatchInternal { has_value };
+            } else {
+                let leaf_type = if is_ptr {
+                    LeafType::Pointer { has_value }
+                } else {
+                    LeafType::Value
+                };
+                result = QueryResult::FullMatchLeaf(leaf_type);
+            }
+        }
+        result
+    }
+
+    #[inline(never)]
     fn find_prefix(&self, matches: [u8x16; 8], key_len: usize) -> Option<QueryResult> {
         let zero = u8x16::splat(0);
         for (i, node_matches) in matches[..key_len - 1].iter().enumerate() {
@@ -157,19 +217,20 @@ impl SimdTree16 {
         let match_bitset = self.match_bitset(match_table);
         // println!("match bitset: {:?}", match_bitset);
 
-        let matches = self.matches(match_bitset);
+        // let matches = self.matches(match_bitset);
+        self.matches2(match_bitset, key_len)
 
         // for i in 0..8 {
         //     println!("{i}: {:?}", matches[i]);
         // }
 
-        if let Some(r) = self.find_prefix(matches, key_len) {
-            return r;
-        }
-        if let Some(r) = self.find_exact(matches, key_len) {
-            return r;
-        }
-        QueryResult::Reject
+        // if let Some(r) = self.find_prefix(matches, key_len) {
+        //     return r;
+        // }
+        // if let Some(r) = self.find_exact(matches, key_len) {
+        //     return r;
+        // }
+        // QueryResult::Reject
     }
 }
 
