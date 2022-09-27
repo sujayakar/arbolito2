@@ -54,6 +54,7 @@ impl From<ScalarTree16> for SimdTree16 {
 // https://github.com/rust-lang/portable-simd/issues/242
 //
 // agner fog of apple M1: https://dougallj.github.io/applecpu/firestorm-simd.html
+// movemask aarch64: https://stackoverflow.com/questions/11870910/sse-mm-movemask-epi8-equivalent-method-for-arm-neon
 impl SimdTree16 {
     fn query(&self, key: &[U4]) -> QueryResult {
         if key.is_empty() {
@@ -126,29 +127,30 @@ impl SimdTree16 {
 
         let matches_char = u8x16::splat(1) & match_bitset;
         let mut matches = under_root.select(matches_char, zero);
-        let mut prefix_matches = is_ptr.select(matches, zero);
+        let mut path = matches;
 
+        // Interestingly, this doesn't seem to get unrolled.
         for i in 0..7 {
-            if i >= key_len {
-                break;
-            }
             let from_parent = arm_shuffle(matches, parent_ix);
             let next_matches = (from_parent << one) & match_bitset;
             let next_matches = has_parent.select(next_matches, zero);
 
-            prefix_matches |= is_ptr.select(next_matches, zero);
-
+            path |= matches;
             matches = next_matches;
         }
 
         let mut result = QueryResult::Reject;
 
-        let prefix_match = prefix_matches.reduce_sum();
+        let prefix_match = is_ptr.select(path, zero).reduce_sum();
         if prefix_match > 0 {
             let consumed = prefix_match.trailing_zeros() as usize + 1;
             result = QueryResult::PartialMatch { consumed };
         }
-        let exact_match = matches.simd_ne(zero).select(step, zero).reduce_sum();
+
+        let exact_match = u8x16::splat(1 << key_len)
+            .simd_eq(path)
+            .select(step, zero)
+            .reduce_sum();
         if exact_match > 0 {
             debug_assert!(exact_match < 16);
             let node = unsafe { self.nodes.as_array().get_unchecked(exact_match as usize) };
