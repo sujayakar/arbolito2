@@ -55,6 +55,15 @@ impl From<ScalarTree16> for SimdTree16 {
 //
 // agner fog of apple M1: https://dougallj.github.io/applecpu/firestorm-simd.html
 impl SimdTree16 {
+    #[inline(never)]
+    fn match_bitset(&self, match_table: u8x16) -> u8x16 {
+        let zero = u8x16::splat(0);
+        let valid_nodes = (u8x16::splat(0b1111_0000) & self.nodes).simd_ne(zero);
+        let match_lookups = arm_shuffle(match_table, self.labels);
+        valid_nodes.select(match_lookups, zero)
+    }
+
+    #[inline(never)]
     fn query(&self, key: &[U4]) -> QueryResult {
         if key.is_empty() {
             return QueryResult::Reject;
@@ -68,19 +77,31 @@ impl SimdTree16 {
             match_table[usize::from(*k)] |= 1 << i;
         }
         let match_table = u8x16::from(match_table);
-        let match_bitset = arm_shuffle(match_table, self.labels);
+        // let valid_nodes = (u8x16::splat(0b1111_0000) & self.nodes).simd_ne(zero);
+        // let match_lookups = arm_shuffle(match_table, self.labels);
+        // let match_bitset = valid_nodes.select(match_lookups, zero);
+        let match_bitset = self.match_bitset(match_table);
+        // println!("match bitset: {:?}", match_bitset);
 
         let mut matches = [zero; 8];
 
         // Start with the matches for nodes under the root.
-        let under_root = (u8x16::splat(0b1000_000) & self.nodes).simd_ne(zero);
-        matches[0] = under_root.select(match_bitset, zero);
+        let under_root = (u8x16::splat(0b1000_0000) & self.nodes).simd_ne(zero);
+        let matches_char = u8x16::splat(1) & match_bitset;
+        matches[0] = under_root.select(matches_char, zero);
 
         for i in 0..7 {
             let prev_matches = matches[i];
-            let shifted = prev_matches >> u8x16::splat(1);
-            matches[i + 1] = match_bitset & shifted;
+            let has_parent = (u8x16::splat(0b1000_0000) & self.nodes).simd_eq(zero);
+            let parent_ix = (u8x16::splat(0b0000_1111) & self.nodes);
+            let copied = arm_shuffle(prev_matches, parent_ix);
+            let next_matches = (copied << u8x16::splat(1)) & match_bitset;
+            matches[i + 1] = has_parent.select(next_matches, zero);
         }
+
+        // for i in 0..8 {
+        //     println!("{i}: {:?}", matches[i]);
+        // }
 
         // TODO: Use reduce sum here? can this be totally branch free?
         for (i, node_matches) in matches[..(key.len() - 1)].iter().enumerate() {
@@ -92,27 +113,25 @@ impl SimdTree16 {
                 return QueryResult::PartialMatch { consumed: i + 1 };
             }
         }
-        let exact_match = (u8x16::splat(1 << (key.len() - 1)) & matches[key.len() - 1]).simd_ne(zero);
-        if exact_match.any() {
-            let exact_match = exact_match.to_array();
-            debug_assert_eq!(exact_match.into_iter().filter(|b| *b).count(), 1);
-            for (i, is_match) in exact_match.iter().enumerate() {
-                if *is_match {
-                    let node = self.nodes.as_array()[i];
-                    let is_branch = (node & (1 << 6)) != 0;
-                    let has_value = (node & (1 << 5)) != 0;
-                    if is_branch {
-                        return QueryResult::FullMatchInternal { has_value };
-                    } else {
-                        let is_ptr = (node & (1 << 4)) != 0;
-                        let leaf_type = if is_ptr {
-                            LeafType::Pointer { has_value }
-                        } else {
-                            LeafType::Value
-                        };
-                        return QueryResult::FullMatchLeaf(leaf_type);
-                    }
-                }
+        let exact_match = (u8x16::splat(1 << (key.len() - 1)) & matches[key.len() - 1])
+            .simd_ne(zero)
+            .to_bitmask();
+        if exact_match != 0 {
+            debug_assert_eq!(exact_match.count_ones(), 1);
+            let i = exact_match.trailing_zeros();
+            let node = self.nodes.as_array()[i as usize];
+            let is_branch = (node & (1 << 6)) != 0;
+            let has_value = (node & (1 << 5)) != 0;
+            if is_branch {
+                return QueryResult::FullMatchInternal { has_value };
+            } else {
+                let is_ptr = (node & (1 << 4)) != 0;
+                let leaf_type = if is_ptr {
+                    LeafType::Pointer { has_value }
+                } else {
+                    LeafType::Value
+                };
+                return QueryResult::FullMatchLeaf(leaf_type);
             }
         }
         QueryResult::Reject
@@ -139,13 +158,39 @@ fn arm_shuffle(table: u8x16, indexes: u8x16) -> u8x16 {
     from_std_arch(result)
 }
 
+use maplit::btreemap;
+
+#[test]
+fn test_simd_trophy() -> anyhow::Result<()> {
+    let t = Tree16 {
+        children: btreemap!(
+            U4::try_from(2)? => Tree16Node::Leaf(LeafType::Value),
+            U4::try_from(8)? => Tree16Node::Leaf(LeafType::Pointer { has_value: false }),
+        ),
+    };
+    let key = vec![
+        U4::try_from(2)?,
+        U4::try_from(8)?,
+    ];
+
+    let scalar = ScalarTree16::from(t.clone());
+    let simd = SimdTree16::from(scalar.clone());
+    assert_eq!(t.query(&key), simd.query(&key));
+
+    Ok(())
+}
+
 proptest! {
-    #![proptest_config(ProptestConfig { failure_persistence: None, .. ProptestConfig::default() })]
+    #![proptest_config(ProptestConfig { cases: 8192, failure_persistence: None, .. ProptestConfig::default() })]
 
     #[test]
     fn test_simd_matches(t in any::<Tree16>(), key in prop::collection::vec(any::<U4>(), 0..=8)) {
         let scalar = ScalarTree16::from(t.clone());
         let simd = SimdTree16::from(scalar.clone());
         assert_eq!(t.query(&key), simd.query(&key));
+
+        for key in t.keys() {
+            assert_eq!(t.query(&key), simd.query(&key));
+        }
     }
 }
