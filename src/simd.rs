@@ -55,6 +55,30 @@ impl From<ScalarTree16> for SimdTree16 {
 //
 // agner fog of apple M1: https://dougallj.github.io/applecpu/firestorm-simd.html
 impl SimdTree16 {
+    fn query(&self, key: &[U4]) -> QueryResult {
+        if key.is_empty() {
+            return QueryResult::Reject;
+        }
+        debug_assert!(key.len() <= 8);
+
+        let mut key_buf = [U4::try_from(0).unwrap(); 8];
+        for (i, k) in key.iter().enumerate() {
+            key_buf[i] = *k;
+        }
+        self._query(key_buf, key.len())
+    }
+
+    #[inline(never)]
+    fn match_table(&self, key: [U4; 8], key_len: usize) -> u8x16 {
+        let mut match_table = [0u8; 16];
+        for (i, k) in key.into_iter().enumerate() {
+            if i < key_len {
+                match_table[usize::from(k)] |= 1 << i;
+            }
+        }
+        u8x16::from(match_table)
+    }
+
     #[inline(never)]
     fn match_bitset(&self, match_table: u8x16) -> u8x16 {
         let zero = u8x16::splat(0);
@@ -64,25 +88,8 @@ impl SimdTree16 {
     }
 
     #[inline(never)]
-    fn query(&self, key: &[U4]) -> QueryResult {
-        if key.is_empty() {
-            return QueryResult::Reject;
-        }
-        assert!(key.len() <= 8);
-
+    fn matches(&self, match_bitset: u8x16) -> [u8x16; 8] {
         let zero = u8x16::splat(0);
-
-        let mut match_table = [0u8; 16];
-        for (i, k) in key.into_iter().enumerate() {
-            match_table[usize::from(*k)] |= 1 << i;
-        }
-        let match_table = u8x16::from(match_table);
-        // let valid_nodes = (u8x16::splat(0b1111_0000) & self.nodes).simd_ne(zero);
-        // let match_lookups = arm_shuffle(match_table, self.labels);
-        // let match_bitset = valid_nodes.select(match_lookups, zero);
-        let match_bitset = self.match_bitset(match_table);
-        // println!("match bitset: {:?}", match_bitset);
-
         let mut matches = [zero; 8];
 
         // Start with the matches for nodes under the root.
@@ -99,21 +106,28 @@ impl SimdTree16 {
             matches[i + 1] = has_parent.select(next_matches, zero);
         }
 
-        // for i in 0..8 {
-        //     println!("{i}: {:?}", matches[i]);
-        // }
+        matches
+    }
 
-        // TODO: Use reduce sum here? can this be totally branch free?
-        for (i, node_matches) in matches[..(key.len() - 1)].iter().enumerate() {
+    #[inline(never)]
+    fn find_prefix(&self, matches: [u8x16; 8], key_len: usize) -> Option<QueryResult> {
+        let zero = u8x16::splat(0);
+        for (i, node_matches) in matches[..key_len - 1].iter().enumerate() {
             let key_matches = (u8x16::splat(1 << i) & node_matches).simd_ne(zero);
             let is_ptr = (u8x16::splat(1 << 4) & self.nodes).simd_ne(zero);
             let prefix_matches = (key_matches & is_ptr).to_bitmask();
             if prefix_matches != 0 {
                 // let i = prefix_matches.count_trailing_zeros();
-                return QueryResult::PartialMatch { consumed: i + 1 };
+                return Some(QueryResult::PartialMatch { consumed: i + 1 });
             }
         }
-        let exact_match = (u8x16::splat(1 << (key.len() - 1)) & matches[key.len() - 1])
+        None
+    }
+
+    #[inline(never)]
+    fn find_exact(&self, matches: [u8x16; 8], key_len: usize) -> Option<QueryResult> {
+        let zero = u8x16::splat(0);
+        let exact_match = (u8x16::splat(1 << (key_len - 1)) & matches[key_len - 1])
             .simd_ne(zero)
             .to_bitmask();
         if exact_match != 0 {
@@ -123,7 +137,7 @@ impl SimdTree16 {
             let is_branch = (node & (1 << 6)) != 0;
             let has_value = (node & (1 << 5)) != 0;
             if is_branch {
-                return QueryResult::FullMatchInternal { has_value };
+                return Some(QueryResult::FullMatchInternal { has_value });
             } else {
                 let is_ptr = (node & (1 << 4)) != 0;
                 let leaf_type = if is_ptr {
@@ -131,8 +145,29 @@ impl SimdTree16 {
                 } else {
                     LeafType::Value
                 };
-                return QueryResult::FullMatchLeaf(leaf_type);
+                return Some(QueryResult::FullMatchLeaf(leaf_type));
             }
+        }
+        None
+    }
+
+    #[inline(never)]
+    fn _query(&self, key: [U4; 8], key_len: usize) -> QueryResult {
+        let match_table = self.match_table(key, key_len);
+        let match_bitset = self.match_bitset(match_table);
+        // println!("match bitset: {:?}", match_bitset);
+
+        let matches = self.matches(match_bitset);
+
+        // for i in 0..8 {
+        //     println!("{i}: {:?}", matches[i]);
+        // }
+
+        if let Some(r) = self.find_prefix(matches, key_len) {
+            return r;
+        }
+        if let Some(r) = self.find_exact(matches, key_len) {
+            return r;
         }
         QueryResult::Reject
     }
