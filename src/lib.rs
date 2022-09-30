@@ -9,3 +9,5 @@ mod scalar;
 
 #[cfg(all(test, target_arch = "aarch64"))]
 mod simd;
+
+mod transpose;

@@ -66,7 +66,7 @@ impl SimdTree16 {
         for (i, k) in key.iter().enumerate() {
             key_buf[i] = *k;
         }
-        self._query(key_buf, key.len())
+        self._query_simd(key_buf, key.len())
     }
 
     #[inline(never)]
@@ -80,7 +80,7 @@ impl SimdTree16 {
         u8x16::from(match_table)
     }
 
-    #[inline(never)]
+    // #[inline(never)]
     fn match_bitset(&self, match_table: u8x16) -> u8x16 {
         let zero = u8x16::splat(0);
         let valid_nodes = (u8x16::splat(0b1111_0000) & self.nodes).simd_ne(zero);
@@ -110,13 +110,13 @@ impl SimdTree16 {
         matches
     }
 
-    #[inline(never)]
+    #[inline(always)]
     fn matches2(&self, match_bitset: u8x16, key_len: usize) -> QueryResult {
         let zero = u8x16::splat(0);
         let one = u8x16::splat(1);
         let mut step = [0u8; 16];
         for i in 0..16 {
-            step[i] = i as u8;
+            step[i] = i as u8 + 1;
         }
         let step = u8x16::from(step);
 
@@ -147,12 +147,13 @@ impl SimdTree16 {
             result = QueryResult::PartialMatch { consumed };
         }
 
-        let exact_match = u8x16::splat(1 << key_len)
+        let exact_match = u8x16::splat(1 << (key_len - 1))
             .simd_eq(path)
             .select(step, zero)
             .reduce_sum();
         if exact_match > 0 {
-            debug_assert!(exact_match < 16);
+            debug_assert!(1 <= exact_match && exact_match < 17);
+            let exact_match = exact_match - 1;
             let node = unsafe { self.nodes.as_array().get_unchecked(exact_match as usize) };
             let is_ptr = node & (1 << 4) != 0;
             let has_value = node & (1 << 5) != 0;
@@ -214,8 +215,14 @@ impl SimdTree16 {
     }
 
     #[inline(never)]
-    fn _query(&self, key: [U4; 8], key_len: usize) -> QueryResult {
-        let match_table = self.match_table(key, key_len);
+    fn _query_simd(&self, key: [U4; 8], key_len: usize) -> QueryResult {
+        use crate::transpose::match_table_simd;
+        let mut k2 = [0u8; 8];
+        for i in 0..8 {
+            k2[i] = key[i].into();
+        }
+        let match_table = match_table_simd(k2, key_len);
+        // let match_table = self.match_table(key, key_len);
         let match_bitset = self.match_bitset(match_table);
         // println!("match bitset: {:?}", match_bitset);
 
@@ -258,17 +265,42 @@ fn arm_shuffle(table: u8x16, indexes: u8x16) -> u8x16 {
 
 use maplit::btreemap;
 
+#[inline(never)]
+fn fakk(s: [u8; 8]) -> impl std::fmt::Debug {
+    use std::simd::u16x8;
+    assert!(s.iter().all(|c| *c <= 15));
+
+    // s: actually a [u4; 8]
+
+    // load into a u16x8
+
+    // load into u16 x 8
+    let mut t: [u16; 8] = [0; 8];
+    for i in 0..8 {
+        t[i] = s[i] as u16;
+    }
+    let t = u16x8::from(t);
+    let mask = u16x8::splat(1) << t;
+
+    mask
+}
+
+#[test]
+fn fak() {
+    // [u4; 8]
+    let s = [1u8, 3, 3, 7, 1, 0, 1, 7];
+    println!("{:?}", fakk(s));
+}
+
 #[test]
 fn test_simd_trophy() -> anyhow::Result<()> {
     let t = Tree16 {
         children: btreemap!(
-            U4::try_from(2)? => Tree16Node::Leaf(LeafType::Value),
-            U4::try_from(8)? => Tree16Node::Leaf(LeafType::Pointer { has_value: false }),
+            U4::try_from(0)? => Tree16Node::Leaf(LeafType::Value),
         ),
     };
     let key = vec![
-        U4::try_from(2)?,
-        U4::try_from(8)?,
+        U4::try_from(0)?,
     ];
 
     let scalar = ScalarTree16::from(t.clone());
@@ -279,7 +311,7 @@ fn test_simd_trophy() -> anyhow::Result<()> {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig { cases: 8192, failure_persistence: None, .. ProptestConfig::default() })]
+    #![proptest_config(ProptestConfig { cases: 81920, failure_persistence: None, .. ProptestConfig::default() })]
 
     #[test]
     fn test_simd_matches(t in any::<Tree16>(), key in prop::collection::vec(any::<U4>(), 0..=8)) {
