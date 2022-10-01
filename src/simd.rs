@@ -263,43 +263,21 @@ fn arm_shuffle(table: u8x16, indexes: u8x16) -> u8x16 {
     from_std_arch(result)
 }
 
-use maplit::btreemap;
 
-#[inline(never)]
-fn fakk(s: [u8; 8]) -> impl std::fmt::Debug {
-    use std::simd::u16x8;
-    assert!(s.iter().all(|c| *c <= 15));
-
-    // s: actually a [u4; 8]
-
-    // load into a u16x8
-
-    // load into u16 x 8
-    let mut t: [u16; 8] = [0; 8];
-    for i in 0..8 {
-        t[i] = s[i] as u16;
-    }
-    let t = u16x8::from(t);
-    let mask = u16x8::splat(1) << t;
-
-    mask
-}
-
-#[test]
-fn fak() {
-    // [u4; 8]
-    let s = [1u8, 3, 3, 7, 1, 0, 1, 7];
-    println!("{:?}", fakk(s));
-}
 
 #[test]
 fn test_simd_trophy() -> anyhow::Result<()> {
     let t = Tree16 {
-        children: btreemap!(
-            U4::try_from(0)? => Tree16Node::Leaf(LeafType::Value),
-        ),
+        children: maplit::btreemap!(),
     };
     let key = vec![
+        U4::try_from(0)?,
+        U4::try_from(0)?,
+        U4::try_from(0)?,
+        U4::try_from(0)?,
+        U4::try_from(0)?,
+        U4::try_from(0)?,
+        U4::try_from(0)?,
         U4::try_from(0)?,
     ];
 

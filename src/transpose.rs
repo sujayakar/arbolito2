@@ -45,19 +45,12 @@ pub fn transpose_u16x8(x: u16x8) -> u8x16 {
     let x = unsafe { mem::transmute::<_, u64x2>(x) };
     let x = transpose_u64x2(x);
     unsafe { mem::transmute::<_, u8x16>(x) }
-
-
-
-    // // Safe to transmute due to same alignment?
-    // let x = unsafe { mem::transmute::<_, u64x2>(x) };
-    // let x = transpose_u64x2(x);
-    // let x = unsafe { mem::transmute::<_, u8x16>(x) };
-    // simd_swizzle!(x, [0, 8, 1, 9, 2, 10, 3, 11, 4, 12, 5, 13, 6, 14, 7, 15])
 }
 
 #[inline(always)]
 pub fn match_table_simd(x: [u8; 8], key_len: usize) -> u8x16 {
     debug_assert!(x.iter().all(|c| *c < 16));
+    debug_assert!(key_len > 0);
 
     let mut buf = [0u16; 8];
     for i in 0..8 {
@@ -68,7 +61,13 @@ pub fn match_table_simd(x: [u8; 8], key_len: usize) -> u8x16 {
     let match_table = transpose_u16x8(x);
 
     // Mask off indexes past our end.
-    let mask = !(0b1111_1111 << key_len);
+    let mask = 0b1111_1111 >> (8 - key_len);
+    // 0: 0000_0000
+    // 1: 0000_0001
+    // 2: 0000_0011
+    // 3: 0000_0111
+    // ..
+    // 8: 1111_1111
     u8x16::splat(mask) & match_table
 }
 
