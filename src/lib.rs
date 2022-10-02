@@ -11,3 +11,6 @@ mod scalar;
 mod simd;
 
 mod transpose;
+
+#[cfg(test)]
+mod simd_loop;

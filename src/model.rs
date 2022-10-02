@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use proptest_derive::Arbitrary;
 use proptest::prelude::*;
 
@@ -35,12 +35,74 @@ impl From<U4> for u8 {
     }
 }
 
+#[derive(Debug)]
+struct BfsOrder<'a> {
+    tree: &'a Tree16,
+    order: Vec<&'a Tree16Node>,
+    by_path: BTreeMap<Vec<U4>, usize>,
+}
+
+impl<'a> BfsOrder<'a> {
+    fn node_ix(&self, key: &[U4]) -> u8 {
+        self.by_path[key] as u8
+    }
+
+    fn ptr_rank(&self, key: &[U4]) -> Option<usize> {
+        let i = self.by_path.get(key)?;
+        if matches!(self.order[*i], Tree16Node::Leaf(LeafType::Pointer { .. })) {
+            let rank = self.order[0..*i]
+                .into_iter()
+                .filter(|n| matches!(n, Tree16Node::Leaf(LeafType::Pointer { .. })))
+                .count();
+            return Some(rank);
+        }
+        None
+    }
+
+    fn value_rank(&self, key: &[U4]) -> Option<usize> {
+        let i = self.by_path.get(key)?;
+        if self.order[*i].has_value() {
+            let rank = self.order[0..*i]
+                .into_iter()
+                .filter(|n| n.has_value())
+                .count();
+            return Some(rank);
+        }
+        None
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Tree16 {
     pub children: BTreeMap<U4, Tree16Node>,
 }
 
 impl Tree16 {
+    fn bfs_order(&self) -> BfsOrder<'_> {
+        let mut queue = VecDeque::new();
+        for (label, node) in &self.children {
+            queue.push_back((vec![*label], node));
+        }
+        let mut order = vec![];
+        let mut by_path = BTreeMap::new();
+
+        while let Some((path, node)) = queue.pop_front() {
+            let i = order.len();
+
+            order.push(node);
+            by_path.insert(path.clone(), i);
+
+            if let Tree16Node::Branch { ref children, .. } = node {
+                for (label, child) in children {
+                    let mut child_path = path.clone();
+                    child_path.push(*label);
+                    queue.push_back((child_path, child));
+                }
+            }
+        }
+        BfsOrder { tree: self, order, by_path }
+    }
+
     pub fn query(&self, key: &[U4]) -> QueryResult {
         match key {
             &[] => QueryResult::Reject,
@@ -51,6 +113,79 @@ impl Tree16 {
                 }
             },
         }
+    }
+
+    pub fn query2(&self, key: &[U4]) -> Option<QueryResult2> {
+        let bfs_order = self.bfs_order();
+        match self.query(key) {
+            QueryResult::FullMatchInternal { has_value } => {
+                let value_rank = bfs_order.value_rank(&key);
+                assert_eq!(value_rank.is_some(), has_value);
+                assert!(bfs_order.ptr_rank(&key).is_none());
+                Some(QueryResult2 {
+                    consumed: key.len() as u8,
+                    node: bfs_order.node_ix(&key),
+                    has_value: value_rank,
+                    has_ptr: None,
+                    is_branch: true,
+                })
+            },
+            QueryResult::FullMatchLeaf(leaf_type) => {
+                let value_rank = bfs_order.value_rank(&key);
+                assert_eq!(value_rank.is_some(), leaf_type.has_value());
+                let ptr_rank = bfs_order.ptr_rank(&key);
+                assert_eq!(ptr_rank.is_some(), matches!(leaf_type, LeafType::Pointer { .. }));
+                Some(QueryResult2 {
+                    consumed: key.len() as u8,
+                    node: bfs_order.node_ix(&key),
+                    has_value: value_rank,
+                    has_ptr: ptr_rank,
+                    is_branch: false,
+                })
+            },
+            QueryResult::PartialMatch { consumed } => {
+                let value_rank = bfs_order.value_rank(&key[..consumed]);
+                let ptr_rank = bfs_order.ptr_rank(&key[..consumed]);
+                assert!(ptr_rank.is_some());
+                Some(QueryResult2 {
+                    consumed: consumed as u8,
+                    node: bfs_order.node_ix(&key[..consumed]),
+                    has_value: value_rank,
+                    has_ptr: ptr_rank,
+                    is_branch: false,
+                })
+            },
+            QueryResult::Reject => None,
+        }
+    }
+
+    pub fn query3(&self, from: Option<U4>, key: &[U4]) -> Option<QueryResult2> {
+        if key.is_empty() {
+            return None;
+        }
+        let bfs_order = self.bfs_order();
+        let mut prefixed: Vec<U4> = vec![];
+        let mut prefix_len = 0;
+        if let Some(i) = from {
+            // Illegal to start from a pointer node.
+            if matches!(bfs_order.order[usize::from(i)], Tree16Node::Leaf(LeafType::Pointer { .. })) {
+                return None;
+            }
+            let prefix = bfs_order
+                .by_path
+                .iter()
+                .filter_map(|(key, j)| if usize::from(i) == *j { Some(key) } else { None })
+                .next()
+                .unwrap();
+            prefix_len += prefix.len() as u8;
+            prefixed.extend(prefix);
+        }
+        prefixed.extend(key);
+        let mut result = self.query2(&prefixed);
+        if let Some(ref mut r) = result {
+            r.consumed -= prefix_len;
+        }
+        result
     }
 
     pub fn keys(&self) -> Vec<Vec<U4>> {
@@ -142,6 +277,19 @@ impl Arbitrary for Tree16 {
             })
             .boxed()
     }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub struct QueryResult2 {
+    pub consumed: u8,
+    pub node: u8,
+
+    // Does the node we landed on have a value? If so, what's its rank within the tree in BFS order?
+    pub has_value: Option<usize>,
+    // Does the node we landed on have a pointer?
+    pub has_ptr: Option<usize>,
+    // Is the node we landed on a branch? (Note that is_branch => has_ptr.is_none())
+    pub is_branch: bool,
 }
 
 #[derive(Debug, Eq, PartialEq)]
