@@ -437,7 +437,7 @@ fn from_std_arch(v: uint8x8x2_t) -> u8x16 {
     unsafe { std::mem::transmute(v) }
 }
 
-fn arm_shuffle(table: u8x16, indexes: u8x16) -> u8x16 {
+pub fn arm_shuffle(table: u8x16, indexes: u8x16) -> u8x16 {
     let table = to_std_arch(table);
     let indexes = to_std_arch(indexes);
     let result = unsafe {
